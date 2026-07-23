@@ -11,6 +11,11 @@
    NOTE: this file deliberately contains no angle-bracket tag text anywhere,
    including in comments, because page builders mangle it.
 
+   v5 changes:
+     - Label resolution now scores candidate elements instead of taking the
+       nearest one, so help text and small print between a question and its
+       field no longer get used as the label.
+
    v4 changes:
      - Attaches to ANY form posting to formspree.io, whether or not it carries
        the mp-quote-form class. No markup edits needed on older forms.
@@ -160,35 +165,80 @@
     var aria = el.getAttribute && el.getAttribute('aria-label');
     if (aria) return tidyLabel(aria);
 
-    // Nearest preceding element that reads like a question.
-    var node = el.previousElementSibling;
-    var hops = 0;
-    while (node && hops < 4) {
-      if (/^(LABEL|H1|H2|H3|H4|H5|H6|P|SPAN|DIV|STRONG|B)$/.test(node.tagName)) {
-        var nt = tidyLabel(txt(node));
-        if (nt && nt.length < 200 && !node.querySelector('input, select, textarea')) return nt;
-      }
-      node = node.previousElementSibling;
-      hops++;
+    // Nearest preceding element that reads like a question. Candidates are
+    // scored rather than taken first come, so explanatory help text sitting
+    // between the question and the control does not win.
+    var best = scanPrevious(el, 5);
+    if (!best) {
+      var parent = el.parentElement;
+      if (parent && parent !== form) best = scanPrevious(parent, 4);
     }
-
-    // Walk up one level and try again.
-    var parent = el.parentElement;
-    if (parent && parent !== form) {
-      var pn = parent.previousElementSibling;
-      var ph = 0;
-      while (pn && ph < 3) {
-        if (/^(LABEL|H1|H2|H3|H4|H5|H6|P|SPAN|DIV|STRONG|B)$/.test(pn.tagName)) {
-          var pt = tidyLabel(txt(pn));
-          if (pt && pt.length < 200 && !pn.querySelector('input, select, textarea')) return pt;
-        }
-        pn = pn.previousElementSibling;
-        ph++;
-      }
-    }
+    if (best) return best;
 
     if (el.placeholder) return tidyLabel(el.placeholder);
     return prettifyName(el.name);
+  }
+
+  // Elements that are help text, not the question.
+  function looksLikeHelp(node, text) {
+    if (!node) return true;
+    if (node.tagName === 'SMALL') return true;
+    var cls = (node.className && node.className.baseVal !== undefined)
+      ? node.className.baseVal : (node.className || '');
+    if (/note|help|hint|desc|small|caption|sub|intro|error/i.test(String(cls))) return true;
+    if (node.id && /note|help|hint|desc/i.test(node.id)) return true;
+
+    try {
+      var fs = parseFloat(window.getComputedStyle(node).fontSize);
+      if (fs && fs < 13) return true;
+    } catch (e) { /* ignore */ }
+
+    // Explanatory sentences rather than a question or a field name.
+    if (text && text.length > 90 && text.indexOf('?') === -1) return true;
+    if (/^(non-standard|e\.g\.|eg\b|note[:\s]|please note|for example|i\.e\.)/i.test(text || '')) return true;
+    return false;
+  }
+
+  function scoreCandidate(node, text) {
+    if (!text || text.length > 220) return -1;
+    if (node.querySelector && node.querySelector('input, select, textarea')) return -1;
+    if (looksLikeHelp(node, text)) return -1;
+
+    var score = 0;
+    if (node.tagName === 'LABEL') score += 60;
+    if (/^H[1-6]$/.test(node.tagName)) score += 45;
+    if (node.tagName === 'STRONG' || node.tagName === 'B') score += 30;
+    if (/^(P|DIV|SPAN)$/.test(node.tagName)) score += 10;
+
+    if (/\?\s*\*?$/.test(text)) score += 45;
+    if (/[:\uFF1A]\s*$/.test(text)) score += 20;
+    if (text.length < 90) score += 15;
+
+    try {
+      var st = window.getComputedStyle(node);
+      var w = parseInt(st.fontWeight, 10);
+      if (w >= 600 || st.fontWeight === 'bold') score += 25;
+    } catch (e) { /* ignore */ }
+
+    return score;
+  }
+
+  function scanPrevious(from, hops) {
+    var node = from.previousElementSibling;
+    var n = 0;
+    var bestText = '';
+    var bestScore = 0;
+
+    while (node && n < hops) {
+      var t = tidyLabel(txt(node));
+      var s = scoreCandidate(node, t);
+      if (s > bestScore) { bestScore = s; bestText = t; }
+      // A strong match immediately before the control is almost certainly it.
+      if (s >= 70) break;
+      node = node.previousElementSibling;
+      n++;
+    }
+    return bestScore > 0 ? bestText : '';
   }
 
   function valueOf(ctrl) {
