@@ -1,26 +1,31 @@
 /* ============================================================================
    Miller and Partner - Quote Form PDF Submission Module
    ----------------------------------------------------------------------------
-   Reads any .mp-quote-form on the page, builds a house-styled PDF of the
-   completed form, attaches it to the Formspree submission, and posts it.
+   Builds a house-styled PDF of any completed quote form, attaches it to the
+   Formspree submission, and posts it.
 
-   Paste this inside a script tag at the bottom of the form's Custom Code
-   element, or host it and reference it by src. It self-initialises on any
-   page containing a .mp-quote-form. No changes are needed to the form markup.
-
-   The PDF goes to Miller and Partner only. The client does not receive a copy.
+   Install once in GHL: Settings, Tracking Code, Body. Use the short loader
+   bootstrap that creates a script element pointing at this file. It then
+   applies to every form on the site with no per-form changes.
 
    NOTE: this file deliberately contains no angle-bracket tag text anywhere,
    including in comments, because page builders mangle it.
 
+   v4 changes:
+     - Attaches to ANY form posting to formspree.io, whether or not it carries
+       the mp-quote-form class. No markup edits needed on older forms.
+     - Forms without the mp- structure now resolve labels the standard HTML
+       way (label for, wrapping label, aria-label, preceding label, placeholder,
+       then a tidied field name) and take headings as section titles.
+     - Radio and checkbox groups are collapsed to one readable line each.
+     - Watches for forms inserted after page load, so builder-rendered forms
+       are picked up whenever they appear.
+
    v3 changes:
-     - A successful send is latched. The native fallback can never fire
-       afterwards, so a failure while drawing the confirmation screen can no
-       longer cause a second duplicate submission.
-     - jsPDF load has a hard timeout, so a blocked CDN submits without the
-       attachment instead of hanging.
-     - Failed validation now names the offending fields instead of doing
-       nothing visible.
+     - A successful send is latched, so a failure while drawing the
+       confirmation screen can no longer cause a duplicate submission.
+     - jsPDF load has a hard timeout.
+     - Failed validation names the offending field.
    ========================================================================== */
 
 (function () {
@@ -30,15 +35,13 @@
      CONFIG
      ------------------------------------------------------------------ */
   var CFG = {
-    formSelector: '.mp-quote-form',
+    // Any form matching this is handled. Covers new mp- forms and every
+    // older form that posts to Formspree.
+    formSelector: '.mp-quote-form, form[action*="formspree.io"]',
 
-    // jsPDF is loaded on demand from CDN.
     jsPDFUrl: 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-
-    // Give up on the CDN after this many ms and submit without a PDF.
     jsPDFTimeoutMs: 8000,
 
-    // Field name the PDF is attached under. Any name works.
     attachmentFieldName: 'completed_form_pdf',
 
     // Brand
@@ -50,25 +53,22 @@
     border: [223, 230, 238],
     white:  [255, 255, 255],
 
-    // Firm details for the PDF footer
     firmName: 'Miller & Partner Ltd',
     firmAddress: 'Vivian House, Roman Bridge Close, Mumbles, Swansea SA3 5BG',
     firmContact: 'enquiries@millerandpartner.co.uk  |  01792 001350',
     firmReg: 'Appointed Representative of Gauntlet Risk Management Ltd  |  FCA Firm Ref 1029698',
 
-    // Page geometry (mm, A4)
     margin: 15,
     headerHeight: 24,
     footerReserve: 20,
 
-    // Show optional fields that were left blank. Selects and required fields
-    // are always shown as "Not answered" regardless of this setting.
     includeEmptyOptional: false,
-
-    // Rewrite the Formspree _subject to include the proposer name and date.
     setSubject: true,
 
-    // Set to true in the console to trace what the module is doing.
+    // Replace the form with an inline thank you on success. Set false to
+    // leave the page alone (useful if a form already has its own handling).
+    showInlineConfirmation: true,
+
     debug: false
   };
 
@@ -85,8 +85,6 @@
     return (el && el.textContent ? el.textContent : '').replace(/\s+/g, ' ').trim();
   }
 
-  // jsPDF standard fonts use WinAnsi. Normalise typographic characters that
-  // commonly arrive from pasted text so nothing renders as a blank box.
   function clean(s) {
     return String(s == null ? '' : s)
       .replace(/[\u2018\u2019\u201A\u2032]/g, "'")
@@ -102,12 +100,95 @@
     return el.getClientRects().length > 0;
   }
 
+  function tidyLabel(s) {
+    return String(s || '')
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\*\s*$/, '')
+      .replace(/\s*:\s*$/, '')
+      .trim();
+  }
+
+  // Turn a field name into something readable when no label exists.
+  function prettifyName(name) {
+    return String(name || '')
+      .replace(/\[\]$/, '')
+      .replace(/[_\-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^./, function (c) { return c.toUpperCase(); });
+  }
+
   function labelOf(group) {
-    var l = group.querySelector(':scope > label');
+    if (!group) return '';
+    var l = group.querySelector(':scope > label') || group.querySelector('label');
     if (!l) return '';
     var c = l.cloneNode(true);
-    each(c.querySelectorAll('.required'), function (s) { s.parentNode.removeChild(s); });
-    return txt(c).replace(/\s*\*\s*$/, '').trim();
+    each(c.querySelectorAll('.required'), function (s) { if (s.parentNode) s.parentNode.removeChild(s); });
+    each(c.querySelectorAll('input, select, textarea'), function (s) { if (s.parentNode) s.parentNode.removeChild(s); });
+    return tidyLabel(txt(c));
+  }
+
+  // Standard HTML label resolution, for forms without the mp- structure.
+  function resolveLabel(el, form) {
+    var group = el.closest ? el.closest('.mp-form-group, .mp-consent') : null;
+    if (group) {
+      var g = labelOf(group);
+      if (g) return g;
+    }
+
+    if (el.id) {
+      var esc = el.id.replace(/"/g, '\\"');
+      var forLabel = form.querySelector('label[for="' + esc + '"]');
+      if (forLabel) {
+        var fc = forLabel.cloneNode(true);
+        each(fc.querySelectorAll('.required'), function (s) { if (s.parentNode) s.parentNode.removeChild(s); });
+        var t = tidyLabel(txt(fc));
+        if (t) return t;
+      }
+    }
+
+    var wrapping = el.closest ? el.closest('label') : null;
+    if (wrapping) {
+      var wc = wrapping.cloneNode(true);
+      each(wc.querySelectorAll('input, select, textarea, .required'), function (s) {
+        if (s.parentNode) s.parentNode.removeChild(s);
+      });
+      var wt = tidyLabel(txt(wc));
+      if (wt) return wt;
+    }
+
+    var aria = el.getAttribute && el.getAttribute('aria-label');
+    if (aria) return tidyLabel(aria);
+
+    // Nearest preceding element that reads like a question.
+    var node = el.previousElementSibling;
+    var hops = 0;
+    while (node && hops < 4) {
+      if (/^(LABEL|H1|H2|H3|H4|H5|H6|P|SPAN|DIV|STRONG|B)$/.test(node.tagName)) {
+        var nt = tidyLabel(txt(node));
+        if (nt && nt.length < 200 && !node.querySelector('input, select, textarea')) return nt;
+      }
+      node = node.previousElementSibling;
+      hops++;
+    }
+
+    // Walk up one level and try again.
+    var parent = el.parentElement;
+    if (parent && parent !== form) {
+      var pn = parent.previousElementSibling;
+      var ph = 0;
+      while (pn && ph < 3) {
+        if (/^(LABEL|H1|H2|H3|H4|H5|H6|P|SPAN|DIV|STRONG|B)$/.test(pn.tagName)) {
+          var pt = tidyLabel(txt(pn));
+          if (pt && pt.length < 200 && !pn.querySelector('input, select, textarea')) return pt;
+        }
+        pn = pn.previousElementSibling;
+        ph++;
+      }
+    }
+
+    if (el.placeholder) return tidyLabel(el.placeholder);
+    return prettifyName(el.name);
   }
 
   function valueOf(ctrl) {
@@ -143,14 +224,24 @@
   }
 
   /* ---------------------------------------------------------------------
-     PARSE - walk the form and produce an ordered list of blocks
+     PARSE - structured mp- forms
      ------------------------------------------------------------------ */
   var SKIP = 'button, .mp-add-row, .mp-remove-row, .mp-submit-wrap, ' +
              '.mp-required-note, .mp-note, .mp-pct-total, template, script, style';
 
+  function isStructured(form) {
+    return !!form.querySelector('.mp-form-group, .mp-section-title, .mp-repeater');
+  }
+
   function parseForm(form) {
     var blocks = [];
-    walk(form, blocks);
+    if (isStructured(form)) {
+      walk(form, blocks);
+      log('parsed as structured mp- form');
+    } else {
+      parseGeneric(form, blocks);
+      log('parsed as generic form');
+    }
     return blocks;
   }
 
@@ -172,20 +263,19 @@
         var cb = el.querySelector('input[type="checkbox"]');
         blocks.push({
           t: 'field',
-          label: txt(el).replace(/\s*\*\s*$/, ''),
+          label: tidyLabel(txt(el)),
           value: cb && cb.checked ? 'Confirmed' : 'NOT CONFIRMED',
           flag: !(cb && cb.checked)
         });
         return;
       }
 
-      // Conditional blocks only count if the user actually revealed them.
       if (cl.contains('mp-conditional')) {
         if (isVisible(el)) walk(el, blocks);
         return;
       }
 
-      if (cl.contains('mp-repeater'))    { pushRepeater(el, blocks); return; }
+      if (cl.contains('mp-repeater')) { pushRepeater(el, blocks); return; }
 
       if (cl.contains('mp-table-scroll')) {
         var tbl = el.querySelector('.mp-income-table, .mp-turnover-table');
@@ -193,9 +283,8 @@
         return;
       }
 
-      if (cl.contains('mp-form-group'))  { pushField(el, blocks); return; }
+      if (cl.contains('mp-form-group')) { pushField(el, blocks); return; }
 
-      // Anything else (e.g. .mp-form-grid) is a container - recurse.
       walk(el, blocks);
     });
   }
@@ -204,7 +293,7 @@
     var ctrl = group.querySelector('input, select, textarea');
     if (!ctrl || ctrl.type === 'hidden') return;
 
-    var label = labelOf(group) || ctrl.name || '';
+    var label = labelOf(group) || prettifyName(ctrl.name);
     var value = valueOf(ctrl);
 
     if (!value) {
@@ -263,7 +352,121 @@
   }
 
   /* ---------------------------------------------------------------------
-     RENDER - draw the blocks into a jsPDF document
+     PARSE - generic forms with no mp- structure
+     ------------------------------------------------------------------ */
+  function parseGeneric(form, blocks) {
+    var nodes = form.querySelectorAll(
+      'h1, h2, h3, h4, h5, h6, legend, .mp-section-title, input, select, textarea'
+    );
+
+    var doneGroups = {};
+
+    each(nodes, function (el) {
+      if (!el || !el.tagName) return;
+
+      // Headings become section titles.
+      if (/^(H[1-6]|LEGEND)$/.test(el.tagName) || (el.classList && el.classList.contains('mp-section-title'))) {
+        var ht = tidyLabel(txt(el));
+        if (ht && ht.length < 160) blocks.push({ t: 'section', text: ht });
+        return;
+      }
+
+      if (el.type === 'hidden' || el.type === 'submit' || el.type === 'button' || el.type === 'reset') return;
+      if (!el.name) return;
+
+      var key = el.type + '::' + el.name;
+
+      // Radio group: one line, showing the chosen option.
+      if (el.type === 'radio') {
+        if (doneGroups[key]) return;
+        doneGroups[key] = true;
+
+        var radios = form.querySelectorAll('input[type="radio"][name="' + el.name.replace(/"/g, '\\"') + '"]');
+        var chosen = '';
+        each(radios, function (r) {
+          if (r.checked) chosen = tidyLabel(resolveLabel(r, form)) || r.value || 'Yes';
+        });
+        blocks.push({
+          t: 'field',
+          label: groupLabel(el, form),
+          value: chosen || 'Not answered',
+          flag: !chosen && el.required
+        });
+        return;
+      }
+
+      // Checkbox group sharing one name: list the ticked options.
+      if (el.type === 'checkbox') {
+        var boxes = form.querySelectorAll('input[type="checkbox"][name="' + el.name.replace(/"/g, '\\"') + '"]');
+        if (boxes.length > 1) {
+          if (doneGroups[key]) return;
+          doneGroups[key] = true;
+
+          var picked = [];
+          each(boxes, function (b) {
+            if (b.checked) picked.push(tidyLabel(resolveLabel(b, form)) || b.value || 'Yes');
+          });
+          if (!picked.length && !CFG.includeEmptyOptional) return;
+          blocks.push({
+            t: 'field',
+            label: groupLabel(el, form),
+            value: picked.length ? picked.join(', ') : 'None selected'
+          });
+          return;
+        }
+
+        // Single checkbox, typically a consent or declaration.
+        var single = resolveLabel(el, form);
+        blocks.push({
+          t: 'field',
+          label: single,
+          value: el.checked ? 'Confirmed' : 'NOT CONFIRMED',
+          flag: !el.checked
+        });
+        return;
+      }
+
+      var value = valueOf(el);
+      if (!value) {
+        var mustShow = (el.tagName === 'SELECT') || el.required || CFG.includeEmptyOptional;
+        if (!mustShow) return;
+        value = 'Not answered';
+      }
+
+      blocks.push({
+        t: 'field',
+        label: resolveLabel(el, form),
+        value: value,
+        flag: value === 'Not answered' && el.required
+      });
+    });
+  }
+
+  // For radio and checkbox groups, prefer the fieldset legend or a heading
+  // above the group rather than the label of one individual option.
+  function groupLabel(el, form) {
+    var fs = el.closest ? el.closest('fieldset') : null;
+    if (fs) {
+      var lg = fs.querySelector('legend');
+      if (lg) {
+        var lt = tidyLabel(txt(lg));
+        if (lt) return lt;
+      }
+    }
+    var wrap = el.closest ? el.closest('.mp-form-group, .mp-checkbox-group, div') : null;
+    if (wrap) {
+      var wl = wrap.querySelector('label');
+      // Only use it if it is not the option's own label.
+      if (wl && !wl.contains(el)) {
+        var wt = tidyLabel(txt(wl));
+        if (wt) return wt;
+      }
+    }
+    return prettifyName(el.name);
+  }
+
+  /* ---------------------------------------------------------------------
+     RENDER
      ------------------------------------------------------------------ */
   function Renderer(title) {
     var jsPDF = window.jspdf.jsPDF;
@@ -311,7 +514,6 @@
     return false;
   };
 
-  // Wrapped text. Returns the height consumed.
   Renderer.prototype.para = function (text, o) {
     o = o || {};
     var size = o.size || 9;
@@ -326,7 +528,6 @@
       this.room(lh + 1);
       this.doc.text(lines[i], CFG.margin + indent, this.y + lh * 0.8);
       this.y += lh;
-      // Re-apply after a possible page break reset.
       this.font(o.style || 'normal', size).ink(o.color || CFG.ink);
     }
     return lines.length * lh;
@@ -418,7 +619,6 @@
       });
       self.y += 2;
 
-      // Only draw the surrounding box when the row did not straddle a page.
       var endPage = self.doc.internal.getCurrentPageInfo().pageNumber;
       if (endPage === startPage) {
         self.doc.setPage(startPage);
@@ -438,7 +638,6 @@
     var cols = head.length;
     var total = this.pw - CFG.margin * 2;
 
-    // First column carries the row label and needs more room.
     var weights = [];
     for (var i = 0; i < cols; i++) weights.push(i === 0 ? 2.4 : 1);
     var sum = weights.reduce(function (a, b) { return a + b; }, 0);
@@ -462,7 +661,6 @@
     drawHead();
 
     rows.forEach(function (row, ri) {
-      // Measure the tallest cell so the row height fits its content.
       self.font('normal', 8);
       var wrapped = [], maxLines = 1;
       for (var c = 0; c < cols; c++) {
@@ -505,7 +703,6 @@
   };
 
   Renderer.prototype.meta = function (formName, proposer) {
-    this.font('bold', 15).ink(CFG.navy);
     this.para(formName, { style: 'bold', size: 15, color: CFG.navy });
     this.gap(1);
     if (proposer) {
@@ -563,13 +760,23 @@
   function formTitle(form) {
     var hidden = form.querySelector('input[name="form_name"]');
     if (hidden && hidden.value) return hidden.value;
-    var container = form.closest('.mp-quote-form-container');
-    var h1 = container ? container.querySelector('h1') : null;
-    return h1 ? txt(h1) : 'Quote Request';
+
+    var subj = form.querySelector('input[name="_subject"]');
+    if (subj && subj.value) return subj.value;
+
+    var container = (form.closest && form.closest('.mp-quote-form-container')) || form.parentElement;
+    var h1 = container ? container.querySelector('h1, h2') : null;
+    if (h1) return txt(h1);
+
+    var pageH1 = document.querySelector('h1');
+    if (pageH1) return txt(pageH1);
+
+    return document.title || 'Quote Request';
   }
 
   function proposerOf(form) {
-    var names = ['proposer_name', 'company_name', 'business_name', 'contact_name'];
+    var names = ['proposer_name', 'company_name', 'business_name', 'trading_name',
+                 'contact_name', 'name', 'full_name', 'your_name'];
     for (var i = 0; i < names.length; i++) {
       var el = form.querySelector('[name="' + names[i] + '"]');
       if (el && el.value && el.value.trim()) return el.value.trim();
@@ -581,7 +788,7 @@
     var title = formTitle(form);
     var proposer = proposerOf(form);
     var blocks = parseForm(form);
-    log('parsed blocks:', blocks.length);
+    log('blocks:', blocks.length);
 
     var r = new Renderer(title);
     r.meta(title, proposer);
@@ -608,7 +815,7 @@
 
     jsPDFPromise = new Promise(function (resolve, reject) {
       var settled = false;
-      function ok()  { if (!settled) { settled = true; resolve(); } }
+      function ok()   { if (!settled) { settled = true; resolve(); } }
       function bad(m) { if (!settled) { settled = true; jsPDFPromise = null; reject(new Error(m)); } }
 
       var s = document.createElement('script');
@@ -621,7 +828,6 @@
       s.onerror = function () { bad('jsPDF request blocked or failed'); };
       document.head.appendChild(s);
 
-      // A blocked request can hang rather than error. Do not wait forever.
       setTimeout(function () { bad('jsPDF load timed out'); }, CFG.jsPDFTimeoutMs);
     });
 
@@ -637,14 +843,10 @@
 
     for (var i = 0; i < bad.length; i++) {
       var el = bad[i];
-      var group = el.closest ? el.closest('.mp-form-group, .mp-consent') : null;
-      var name = (group ? labelOf(group) : '') || el.name || 'a required field';
-      // Prefer a field the user can actually see.
-      if (isVisible(el)) return { el: el, name: name, hidden: false };
+      if (isVisible(el)) return { el: el, name: resolveLabel(el, form), hidden: false };
     }
     var f = bad[0];
-    var g = f.closest ? f.closest('.mp-form-group, .mp-consent') : null;
-    return { el: f, name: (g ? labelOf(g) : '') || f.name || 'a required field', hidden: true };
+    return { el: f, name: resolveLabel(f, form), hidden: true };
   }
 
   function showValidationNotice(form, info) {
@@ -661,7 +863,8 @@
     box.textContent = 'Please complete "' + info.name + '" before submitting.' +
       (info.hidden ? ' It may be inside a section that is not currently open.' : '');
 
-    var wrap = form.querySelector('.mp-submit-wrap');
+    var wrap = form.querySelector('.mp-submit-wrap') ||
+               form.querySelector('button[type="submit"], input[type="submit"]');
     if (wrap && wrap.parentNode) wrap.parentNode.insertBefore(box, wrap);
     else form.appendChild(box);
 
@@ -684,6 +887,8 @@
      CONFIRMATION SCREEN
      ------------------------------------------------------------------ */
   function showConfirmation(form) {
+    if (!CFG.showInlineConfirmation) return;
+
     var container = (form.closest && form.closest('.mp-quote-form-container')) || form.parentNode;
     if (!container) return;
 
@@ -714,7 +919,12 @@
      SUBMIT
      ------------------------------------------------------------------ */
   function attach(form) {
-    if (form.getAttribute('data-mp-pdf') === 'on') return;
+    if (!form || form.getAttribute('data-mp-pdf') === 'on') return;
+    if (!form.action || form.action.indexOf('formspree.io') === -1) {
+      // Only handle Formspree endpoints. Anything else is left alone.
+      if (!form.classList.contains('mp-quote-form')) return;
+      if (form.action.indexOf('formspree.io') === -1) return;
+    }
     form.setAttribute('data-mp-pdf', 'on');
 
     var btn = form.querySelector('button[type="submit"], input[type="submit"]');
@@ -729,8 +939,6 @@
       else btn.value = on ? (msg || 'Sending...') : btnLabel;
     }
 
-    // Latched per submit attempt. Once a send has succeeded, nothing may
-    // trigger the native fallback - that is what caused duplicate entries.
     var sent = false;
     var inFlight = false;
 
@@ -782,7 +990,6 @@
           if (res && res.ok) { log('sent with attachment:', !!pdf); return true; }
           log('first post rejected, status', res && res.status);
           if (!pdf) return false;
-          // The attachment may have been rejected. Retry without it.
           return post(form, null, false).then(function (res2) {
             log('retry without attachment, status', res2 && res2.status);
             return !!(res2 && res2.ok);
@@ -796,8 +1003,6 @@
           hardFallback();
         });
 
-      // Success path. Errors in here must never reach the outer catch,
-      // or a cosmetic failure would trigger a second submission.
       function finish() {
         sent = true;
         inFlight = false;
@@ -811,7 +1016,6 @@
         }
       }
 
-      // Never lose a lead: fall back to a plain browser POST.
       function hardFallback() {
         if (sent) { log('fallback suppressed - already sent'); return; }
         sent = true;
@@ -822,6 +1026,8 @@
         HTMLFormElement.prototype.submit.call(form);
       }
     });
+
+    log('attached to form:', form.action);
   }
 
   function post(form, pdf, withAttachment) {
@@ -843,13 +1049,25 @@
   /* ---------------------------------------------------------------------
      INIT
      ------------------------------------------------------------------ */
-  function init() {
+  function scan() {
     var forms = document.querySelectorAll(CFG.formSelector);
-    if (!forms.length) return;
     each(forms, attach);
-    // Warm the dependency so submitting feels instant.
-    loadJsPDF().catch(function () {});
-    log('attached to ' + forms.length + ' form(s)');
+    return forms.length;
+  }
+
+  function init() {
+    var n = scan();
+    if (n) loadJsPDF().catch(function () {});
+    log('initial scan found ' + n + ' form(s)');
+
+    // Builders often insert forms after load. Keep watching.
+    if (window.MutationObserver && document.body) {
+      var mo = new MutationObserver(function () {
+        var found = scan();
+        if (found) loadJsPDF().catch(function () {});
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+    }
   }
 
   if (document.readyState === 'loading') {
@@ -858,9 +1076,10 @@
     init();
   }
 
-  // Expose for manual testing: MPQuotePDF.preview()
   window.MPQuotePDF = {
     config: CFG,
+    rescan: scan,
+    forms: function () { return document.querySelectorAll(CFG.formSelector); },
     preview: function () {
       var form = document.querySelector(CFG.formSelector);
       if (!form) { console.warn('[mp-pdf] no form found'); return; }
