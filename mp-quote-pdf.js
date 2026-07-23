@@ -11,6 +11,16 @@
    NOTE: this file deliberately contains no angle-bracket tag text anywhere,
    including in comments, because page builders mangle it.
 
+   v6 changes:
+     - A form is only treated as a structured mp- form if it actually contains
+       mp-form-group or mp-repeater. Forms that use mp-section-title headings
+       but plain divs around their fields were being walked as structured and
+       produced a PDF of headings with no data. They now take the generic path.
+     - The generic parser ignores fields and headings that are not currently
+       visible, so collapsed or product-specific sections do not fill the PDF
+       with blanks.
+     - Section headings left with nothing under them are dropped before render.
+
    v5 changes:
      - Label resolution now scores candidate elements instead of taking the
        nearest one, so help text and small print between a question and its
@@ -280,7 +290,11 @@
              '.mp-required-note, .mp-note, .mp-pct-total, template, script, style';
 
   function isStructured(form) {
-    return !!form.querySelector('.mp-form-group, .mp-section-title, .mp-repeater');
+    // mp-section-title alone is NOT enough. A form can use our section
+    // headings while wrapping its fields in plain divs, and the structured
+    // walker only emits fields from mp-form-group, so it would render a
+    // heading-only PDF. Those forms belong on the generic path.
+    return !!form.querySelector('.mp-form-group, .mp-repeater');
   }
 
   function parseForm(form) {
@@ -292,7 +306,27 @@
       parseGeneric(form, blocks);
       log('parsed as generic form');
     }
-    return blocks;
+    return pruneEmptySections(blocks);
+  }
+
+  // Drop a section or subsection heading that has nothing under it, so a
+  // form with sections the user never opened does not print bare headings.
+  function pruneEmptySections(blocks) {
+    var out = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var b = blocks[i];
+      if (b.t === 'section' || b.t === 'subsection') {
+        var hasContent = false;
+        for (var j = i + 1; j < blocks.length; j++) {
+          var n = blocks[j];
+          if (n.t === 'section' || n.t === 'subsection') break;
+          if (n.t !== 'note') { hasContent = true; break; }
+        }
+        if (!hasContent) continue;
+      }
+      out.push(b);
+    }
+    return out;
   }
 
   function walk(node, blocks) {
@@ -414,9 +448,20 @@
     each(nodes, function (el) {
       if (!el || !el.tagName) return;
 
+      // Ignore anything not currently on screen. Product-specific panels,
+      // collapsed accordions and conditional boxes would otherwise fill the
+      // PDF with headings and blanks the customer never saw.
+      var isHiddenInput = (el.tagName === 'INPUT' && el.type === 'hidden');
+      if (!isHiddenInput && !isVisible(el)) return;
+
       // Headings become section titles.
       if (/^(H[1-6]|LEGEND)$/.test(el.tagName) || (el.classList && el.classList.contains('mp-section-title'))) {
-        var ht = tidyLabel(txt(el));
+        // Strip any mp-sub hint text so the heading reads cleanly.
+        var hc = el.cloneNode(true);
+        each(hc.querySelectorAll('.mp-sub'), function (sub) {
+          if (sub.parentNode) sub.parentNode.removeChild(sub);
+        });
+        var ht = tidyLabel(txt(hc));
         if (ht && ht.length < 160) blocks.push({ t: 'section', text: ht });
         return;
       }
