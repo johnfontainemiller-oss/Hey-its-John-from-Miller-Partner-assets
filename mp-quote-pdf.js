@@ -11,6 +11,13 @@
    NOTE: this file deliberately contains no angle-bracket tag text anywhere,
    including in comments, because page builders mangle it.
 
+   v7 changes:
+     - On a confirmed successful send, a quote_form_submitted event is sent
+       to Google Analytics 4 (via the site's gtag), carrying the form name,
+       form id, Formspree endpoint, page path and whether a PDF was attached.
+       Fires only after Formspree returns OK, so it counts real enquiries,
+       never attempts. Silent no-op if gtag is not present on the page.
+
    v6 changes:
      - A form is only treated as a structured mp- form if it actually contains
        mp-form-group or mp-repeater. Forms that use mp-section-title headings
@@ -83,6 +90,10 @@
     // Replace the form with an inline thank you on success. Set false to
     // leave the page alone (useful if a form already has its own handling).
     showInlineConfirmation: true,
+
+    // Send a quote_form_submitted event to GA4 after a confirmed send.
+    analyticsEvent: true,
+    analyticsEventName: 'quote_form_submitted',
 
     debug: false
   };
@@ -1011,6 +1022,30 @@
   }
 
   /* ---------------------------------------------------------------------
+     ANALYTICS
+     Reports a confirmed submission to GA4. The form name is captured at
+     the start of the submit, before the email subject is rewritten to
+     include the proposer's name, so no personal data reaches Analytics.
+     ------------------------------------------------------------------ */
+  function trackSubmission(form, name, attached) {
+    if (!CFG.analyticsEvent) return;
+    try {
+      if (typeof window.gtag !== 'function') { log('gtag not present, submission not reported'); return; }
+      var endpoint = String(form.action || '').replace(/^https?:\/\/(www\.)?/, '');
+      window.gtag('event', CFG.analyticsEventName, {
+        form_name: clean(name || 'Quote Request').slice(0, 100),
+        form_id: form.id || '',
+        form_destination: endpoint,
+        pdf_attached: attached ? 'yes' : 'no',
+        page_path: window.location.pathname
+      });
+      log('GA4 event sent:', CFG.analyticsEventName, name);
+    } catch (err) {
+      log('GA4 event failed (submission unaffected):', err);
+    }
+  }
+
+  /* ---------------------------------------------------------------------
      SUBMIT
      ------------------------------------------------------------------ */
   function attach(form) {
@@ -1055,6 +1090,7 @@
       busy(true, 'Preparing your form...');
 
       var pdf = null;
+      var gaFormName = formTitle(form);
 
       loadJsPDF()
         .then(function () {
@@ -1101,6 +1137,7 @@
       function finish() {
         sent = true;
         inFlight = false;
+        trackSubmission(form, gaFormName, !!pdf);
         try {
           busy(false);
           var next = form.querySelector('input[name="_next"]');
@@ -1117,6 +1154,7 @@
         inFlight = false;
         busy(false);
         log('falling back to native submit');
+        trackSubmission(form, gaFormName, false);
         form.setAttribute('data-mp-pdf', 'off');
         HTMLFormElement.prototype.submit.call(form);
       }
