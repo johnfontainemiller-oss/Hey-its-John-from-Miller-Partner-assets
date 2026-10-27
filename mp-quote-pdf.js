@@ -11,6 +11,18 @@
    NOTE: this file deliberately contains no angle-bracket tag text anywhere,
    including in comments, because page builders mangle it.
 
+   v8 changes:
+     - Records where each enquiry came from. On every page view the module
+       notes the referring site (host only), any utm_source tag and the first
+       page of the visit, for both the current visit and the very first visit
+       on that browser. At submit, these are added to the Formspree
+       submission as hidden fields: lead_source, lead_referrer, landing_page,
+       form_page, first_source, first_landing_page. AI assistants are
+       recognised by name (ChatGPT, Copilot, Perplexity, Gemini, Claude and
+       others). The same line is printed under the submitted date on the
+       PDF, and lead_source is added to the GA4 event. No personal data is
+       collected; if browser storage is blocked it falls back to this page.
+
    v7 changes:
      - On a confirmed successful send, a quote_form_submitted event is sent
        to Google Analytics 4 (via the site's gtag), carrying the form name,
@@ -94,6 +106,10 @@
     // Send a quote_form_submitted event to GA4 after a confirmed send.
     analyticsEvent: true,
     analyticsEventName: 'quote_form_submitted',
+
+    // Lead source attribution (v8).
+    sourceTracking: true,
+    sourceFirstTouchDays: 90,
 
     debug: false
   };
@@ -816,6 +832,9 @@
       this.gap(0.5);
     }
     this.para('Submitted ' + stamp(), { size: 8, color: CFG.muted });
+    var srcLine = '';
+    try { srcLine = sourceLine(); } catch (e) { srcLine = ''; }
+    if (srcLine) this.para(srcLine, { size: 8, color: CFG.muted });
     this.gap(3);
     this.line(CFG.border);
     this.doc.setLineWidth(0.3);
@@ -1022,6 +1041,156 @@
   }
 
   /* ---------------------------------------------------------------------
+     LEAD SOURCE (v8)
+     ------------------------------------------------------------------ */
+  var SRC_KEY_VISIT = 'mpLeadVisit';
+  var SRC_KEY_FIRST = 'mpLeadFirst';
+
+  var SOURCE_RULES = [
+    [/(^|\.)chatgpt\.com$|(^|\.)openai\.com$/, 'ChatGPT'],
+    [/(^|\.)copilot\.microsoft\.com$|(^|\.)copilot\.cloud\.microsoft$/, 'Copilot'],
+    [/(^|\.)perplexity\.ai$/, 'Perplexity'],
+    [/(^|\.)gemini\.google\.com$|(^|\.)bard\.google\.com$/, 'Gemini'],
+    [/(^|\.)claude\.ai$/, 'Claude'],
+    [/(^|\.)you\.com$|(^|\.)phind\.com$|(^|\.)deepseek\.com$|(^|\.)meta\.ai$|(^|\.)grok\.com$|(^|\.)mistral\.ai$/, 'Other AI assistant'],
+    [/(^|\.)google\.[a-z.]+$/, 'Google'],
+    [/(^|\.)bing\.com$/, 'Bing'],
+    [/(^|\.)duckduckgo\.com$|(^|\.)yahoo\.[a-z.]+$|(^|\.)ecosia\.org$|(^|\.)yandex\.[a-z.]+$|(^|\.)search\.brave\.com$/, 'Other search engine'],
+    [/(^|\.)facebook\.com$|(^|\.)fb\.com$|(^|\.)instagram\.com$/, 'Facebook / Instagram'],
+    [/(^|\.)linkedin\.com$|(^|\.)lnkd\.in$/, 'LinkedIn'],
+    [/(^|\.)t\.co$|(^|\.)x\.com$|(^|\.)twitter\.com$/, 'X'],
+    [/(^|\.)youtube\.com$/, 'YouTube']
+  ];
+
+  var UTM_RULES = [
+    [/chatgpt|openai/i, 'ChatGPT'],
+    [/copilot/i, 'Copilot'],
+    [/perplexity/i, 'Perplexity'],
+    [/gemini/i, 'Gemini'],
+    [/claude/i, 'Claude']
+  ];
+
+  function srcStore(kind) {
+    try { return kind === 'visit' ? window.sessionStorage : window.localStorage; } catch (e) { return null; }
+  }
+
+  function srcRead(kind, key) {
+    var st = srcStore(kind);
+    if (!st) return null;
+    try { var v = st.getItem(key); return v ? JSON.parse(v) : null; } catch (e) { return null; }
+  }
+
+  function srcWrite(kind, key, obj) {
+    var st = srcStore(kind);
+    if (!st) return;
+    try { st.setItem(key, JSON.stringify(obj)); } catch (e) { /* storage blocked */ }
+  }
+
+  function refHost() {
+    try {
+      if (!document.referrer) return '';
+      var h = new URL(document.referrer).hostname.toLowerCase().replace(/^www\./, '');
+      var own = window.location.hostname.toLowerCase().replace(/^www\./, '');
+      return h === own ? 'self' : h;
+    } catch (e) { return ''; }
+  }
+
+  function utmSource() {
+    try { return (new URLSearchParams(window.location.search).get('utm_source') || '').slice(0, 60); } catch (e) { return ''; }
+  }
+
+  function classify(host, utm) {
+    var i;
+    if (utm) {
+      for (i = 0; i < UTM_RULES.length; i++) if (UTM_RULES[i][0].test(utm)) return UTM_RULES[i][1];
+    }
+    if (host) {
+      for (i = 0; i < SOURCE_RULES.length; i++) if (SOURCE_RULES[i][0].test(host)) return SOURCE_RULES[i][1];
+      return 'Referral: ' + host;
+    }
+    if (utm) return 'Campaign: ' + utm;
+    return 'Direct / unknown';
+  }
+
+  function currentTouch() {
+    var host = refHost();
+    if (host === 'self') return null;
+    var utm = utmSource();
+    return {
+      source: classify(host, utm),
+      referrer: host || (utm ? 'utm_source=' + utm : ''),
+      landing: window.location.pathname,
+      at: Date.now()
+    };
+  }
+
+  function recordSource() {
+    if (!CFG.sourceTracking) return;
+    var touch = currentTouch();
+    if (!touch) {
+      // Internal navigation. Make sure a visit record exists even if storage
+      // was cleared mid-visit.
+      if (!srcRead('visit', SRC_KEY_VISIT)) {
+        srcWrite('visit', SRC_KEY_VISIT, { source: 'Direct / unknown', referrer: '', landing: window.location.pathname, at: Date.now() });
+      }
+    } else {
+      var visit = srcRead('visit', SRC_KEY_VISIT);
+      // A new external arrival replaces the visit record, except a bare
+      // direct arrival, which never overwrites a known source.
+      if (!visit || touch.source !== 'Direct / unknown') srcWrite('visit', SRC_KEY_VISIT, touch);
+    }
+    var first = srcRead('first', SRC_KEY_FIRST);
+    var maxAge = CFG.sourceFirstTouchDays * 86400000;
+    if (!first || (Date.now() - (first.at || 0)) > maxAge) {
+      srcWrite('first', SRC_KEY_FIRST, touch || srcRead('visit', SRC_KEY_VISIT) || { source: 'Direct / unknown', referrer: '', landing: window.location.pathname, at: Date.now() });
+    }
+  }
+
+  function leadSource() {
+    var visit = srcRead('visit', SRC_KEY_VISIT) || currentTouch() || { source: 'Direct / unknown', referrer: '', landing: window.location.pathname };
+    var first = srcRead('first', SRC_KEY_FIRST) || visit;
+    return {
+      lead_source: visit.source || '',
+      lead_referrer: visit.referrer || '',
+      landing_page: visit.landing || '',
+      form_page: window.location.pathname,
+      first_source: first.source || '',
+      first_landing_page: first.landing || ''
+    };
+  }
+
+  function sourceLine() {
+    if (!CFG.sourceTracking) return '';
+    var s = leadSource();
+    var line = 'Source: ' + s.lead_source + '  |  Landed on ' + s.landing_page;
+    if (s.first_source && (s.first_source !== s.lead_source || s.first_landing_page !== s.landing_page)) {
+      line += '  |  First visit: ' + s.first_source + ', ' + s.first_landing_page;
+    }
+    return line;
+  }
+
+  // Writes the source values into hidden inputs on the form, so they travel
+  // with the fetch submission and with the native fallback alike.
+  function stampSource(form) {
+    if (!CFG.sourceTracking) return;
+    try {
+      var s = leadSource();
+      Object.keys(s).forEach(function (k) {
+        var el = form.querySelector('input[name="' + k + '"]');
+        if (!el) {
+          el = document.createElement('input');
+          el.type = 'hidden';
+          el.name = k;
+          form.appendChild(el);
+        }
+        el.value = String(s[k]).slice(0, 200);
+      });
+    } catch (err) {
+      log('source stamp failed (submission unaffected):', err);
+    }
+  }
+
+  /* ---------------------------------------------------------------------
      ANALYTICS
      Reports a confirmed submission to GA4. The form name is captured at
      the start of the submit, before the email subject is rewritten to
@@ -1037,7 +1206,8 @@
         form_id: form.id || '',
         form_destination: endpoint,
         pdf_attached: attached ? 'yes' : 'no',
-        page_path: window.location.pathname
+        page_path: window.location.pathname,
+        lead_source: CFG.sourceTracking ? leadSource().lead_source.slice(0, 100) : ''
       });
       log('GA4 event sent:', CFG.analyticsEventName, name);
     } catch (err) {
@@ -1087,6 +1257,7 @@
       clearValidationNotice();
 
       inFlight = true;
+      stampSource(form);
       busy(true, 'Preparing your form...');
 
       var pdf = null;
@@ -1189,6 +1360,7 @@
   }
 
   function init() {
+    try { recordSource(); } catch (e) { log('source record failed:', e); }
     var n = scan();
     if (n) loadJsPDF().catch(function () {});
     log('initial scan found ' + n + ' form(s)');
@@ -1212,6 +1384,8 @@
   window.MPQuotePDF = {
     config: CFG,
     rescan: scan,
+    version: 8,
+    source: function () { return leadSource(); },
     forms: function () { return document.querySelectorAll(CFG.formSelector); },
     preview: function () {
       var form = document.querySelector(CFG.formSelector);
